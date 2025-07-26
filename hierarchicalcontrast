@@ -1,0 +1,126 @@
+import torch
+from torch import nn
+from .memory import ContrastMemory
+from .midmemory import midContrastMemory
+import torch.nn.functional as F
+
+eps = 1e-7
+
+
+class hsaCRDLoss(nn.Module):
+    def __init__(self, args):
+        super(hsaCRDLoss, self).__init__()
+        self.hsaembed_s = Hierarchicalprojector(args.s_dims, args.feat_dim)
+        self.hsaembed_t = Hierarchicalprojector(args.t_dims, args.feat_dim)
+        self.contrast_layers = nn.ModuleList([
+            ContrastMemory(args.feat_dim, args.n_data, args.nce_k, args.ncemid_t, args.nce_m).cuda()
+            for _ in range(len(args.s_dims))
+        ])
+        # self.contrast_layers = nn.ModuleList([
+        #     midContrastMemory(args.feat_dim, args.n_data, args.nce_k, args.ncemid_t, args.nce_m).cuda()
+        #     for _ in self.selected_layers
+        # ])
+        self.criterion_t = ContrastLoss(args.n_data)
+        self.criterion_s = ContrastLoss(args.n_data)
+        self.layer_weights = nn.Parameter(torch.Tensor([1.0] * len(args.s_dims)))
+
+    def forward(self, f_s_list, f_t_list, idx, contrast_idx=None, ali=1, lam=0.1):
+        proj_s = self.hsaembed_s(f_s_list)
+        proj_t = self.hsaembed_t(f_t_list)
+        crd_loss = 0
+        for layer_idx, (s_feat, t_feat) in enumerate(zip(proj_s, proj_t)):
+            with torch.no_grad():
+                out_s, out_t = self.contrast_layers[layer_idx](s_feat, t_feat, idx, contrast_idx)
+            alignment_loss = lalign(s_feat, t_feat)
+            uniformity_loss = (lunif(s_feat) + lunif(t_feat)) / 2
+            layer_loss = self.criterion_s(out_s) + self.criterion_t(out_t)
+            crd_loss += self.layer_weights[layer_idx] * layer_loss
+
+        return crd_loss
+
+
+class ContrastLoss(nn.Module):
+    """
+    contrastive loss, corresponding to Eq (18)
+    """
+    def __init__(self, n_data):
+        super(ContrastLoss, self).__init__()
+        self.n_data = n_data
+
+    def forward(self, x):
+        bsz = x.shape[0]
+        m = x.size(1) - 1
+
+        # ‘loss old’
+
+        # noise distribution
+        Pn = 1 / float(self.n_data)
+
+        # loss for positive pair
+        P_pos = x.select(1, 0)
+        log_D1 = torch.div(P_pos, P_pos.add(m * Pn + eps)).log_()
+
+        # loss for K negative pair
+        P_neg = x.narrow(1, 1, m)
+        log_D0 = torch.div(P_neg.clone().fill_(m * Pn), P_neg.add(m * Pn + eps)).log_()
+
+        loss = - (log_D1.sum(0) + log_D0.view(-1, 1).sum(0)) / bsz
+
+        # 'loss new'
+        # P_pos = x.select(1, 0)  # 64, 1
+        # log_P = torch.log(P_pos)
+        # # P_neg = x.narrow(1, 1, m) # bs, K, 1
+        # # log_N= torch.log(P_pos + P_neg.sum(1))
+        # log_N = torch.log(x.sum(1))
+        # loss = ((- log_P.sum(0) + log_N.sum(0)) / bsz)
+
+        return loss
+
+def lalign(x, y, alpha=2):
+        return (x - y).norm(dim=1).pow(alpha).mean()
+def lunif(x, t=2):
+    sq_pdist = torch.pdist(x, p=2).pow(2)
+    return sq_pdist.mul(-t).exp().mean().log()
+
+class Normalize(nn.Module):
+    """normalization layer"""
+    def __init__(self, power=2):
+        super(Normalize, self).__init__()
+        self.power = power
+
+    def forward(self, x):
+        norm = x.pow(self.power).sum(1, keepdim=True).pow(1. / self.power)
+        out = x.div(norm)
+        return out
+class Hierarchicalprojector(nn.Module):
+    def __init__(self, in_dims, out_dim=128):
+        super().__init__()
+        self.projectors = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, out_dim),
+                Normalize(2)
+            ).cuda() for dim in in_dims
+        ])
+
+    def forward(self, feats_list):
+        proj_feats = []
+        for feat, proj in zip(feats_list, self.projectors):
+            feat_pool = F.adaptive_avg_pool2d(feat, 1).view(feat.size(0), -1)
+            # feat_flat = feat.view(feat.size(0), -1).cuda()
+            proj_feats.append(proj(feat_pool))
+        return proj_feats
+class Embed(nn.Module):
+    """Embedding module"""
+    def __init__(self, dim_in=1024, dim_out=128):
+        super(Embed, self).__init__()
+        self.linear = nn.Linear(dim_in, dim_out).cuda()
+        self.l2norm = Normalize(2).cuda()
+
+    def forward(self, x):
+        x = x.view(x.shape[0], -1)
+        # print(x.size())
+        x = self.linear(x)
+        x = self.l2norm(x)
+        # print(x.size())
+
+        return x
